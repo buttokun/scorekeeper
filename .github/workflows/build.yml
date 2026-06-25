@@ -1,0 +1,73 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  NODE_VERSION: 20
+  GO_VERSION: 1.22
+  PNPM_VERSION: 10.33.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Checkout latest frontend release
+        run: |
+          cd frontend
+          git fetch --tags
+          git checkout $(git describe --tags `git rev-list --tags --max-count=1`)
+
+      - name: Checkout latest backend release
+        run: |
+          cd backend
+          git fetch --tags
+          git checkout $(git describe --tags `git rev-list --tags --max-count=1`)
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build Frontend
+        working-directory: ./frontend
+        run: |
+          pnpm install
+          pnpm run build
+
+      - name: Copy dist to backend
+        run: cp -r frontend/dist backend/dist
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build Go Binary
+        working-directory: ./backend
+        run: go build -o myapp ./...
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: backend/myapp
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
