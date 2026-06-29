@@ -1,0 +1,20 @@
+FROM alpine:3
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -g 1000 scorekeeper \
+    && adduser -D -u 1000 -G scorekeeper scorekeeper
+
+WORKDIR /app
+
+ARG TARGETPLATFORM
+COPY scorekeeper-linux-amd64 scorekeeper-linux-arm64 scorekeeper-linux-armv7 /tmp/
+RUN case "$TARGETPLATFORM" in \
+      "linux/amd64")  mv /tmp/scorekeeper-linux-amd64  /app/scorekeeper ;; \
+      "linux/arm64")  mv /tmp/scorekeeper-linux-arm64  /app/scorekeeper ;; \
+      "linux/arm/v7") mv /tmp/scorekeeper-linux-armv7  /app/scorekeeper ;; \
+      *) echo "unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+    esac && chmod +x /app/scorekeeper && rm -f /tmp/scorekeeper-*
+
+USER scorekeeper
+EXPOSE 8080
+ENTRYPOINT ["/app/scorekeeper"]
+CMD ["serve"]
