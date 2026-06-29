@@ -1,4 +1,4 @@
-name: Build
+name: Release
 
 on:
   push:
@@ -7,16 +7,18 @@ on:
 
 env:
   NODE_VERSION: 20
-  GO_VERSION: 1.22
+  GO_VERSION: "1"
   PNPM_VERSION: 10.33.0
+  REGISTRY: ghcr.io
+  IMAGE_NAME: buttokun/scorekeeper
 
 jobs:
-  build:
+  # ── Vue UI build ──────────────────────────────────────────────────────────────
+  # Checks out the frontend submodule at its latest release tag, builds with
+  # pnpm, and uploads the dist as an artifact for the binary build jobs.
+  build-ui:
+    name: Build UI
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,13 +29,7 @@ jobs:
         run: |
           cd frontend
           git fetch --tags
-          git checkout $(git describe --tags `git rev-list --tags --max-count=1`)
-
-      - name: Checkout latest backend release
-        run: |
-          cd backend
-          git fetch --tags
-          git checkout $(git describe --tags `git rev-list --tags --max-count=1`)
+          git checkout $(git describe --tags $(git rev-list --tags --max-count=1))
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -53,21 +49,148 @@ jobs:
           pnpm install
           pnpm run build
 
-      - name: Copy dist to backend
-        run: cp -r frontend/dist backend/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: frontend/dist/
+          if-no-files-found: error
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+  # ── Binary build ─────────────────────────────────────────────────────────────
+  # Checks out the backend submodule at its latest release tag, injects the
+  # pre-built UI dist, and cross-compiles a fully static binary for each target.
+  build-binary:
+    name: Binary (${{ matrix.artifact }})
+    needs: build-ui
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            goarm: ""
+            artifact: scorekeeper-linux-amd64
+          - goarch: arm64
+            goarm: ""
+            artifact: scorekeeper-linux-arm64
+          - goarch: arm
+            goarm: "7"
+            artifact: scorekeeper-linux-armv7
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Checkout latest backend release
+        run: |
+          cd backend
+          git fetch --tags
+          git checkout $(git describe --tags $(git rev-list --tags --max-count=1))
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: backend/web/dist/
+
+      - name: Ensure embed placeholder exists
+        run: touch backend/web/dist/.gitkeep
+
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: backend/go.sum
 
-      - name: Build Go Binary
+      - name: Build
         working-directory: ./backend
-        run: go build -o myapp ./...
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          go build \
+            -ldflags "-s -w -X github.com/kondanta/kansou/cmd.version=${GITHUB_REF_NAME}" \
+            -o ../${{ matrix.artifact }} .
 
-      - name: Create GitHub Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  # ── GitHub Release ────────────────────────────────────────────────────────────
+  release:
+    name: GitHub Release
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: backend/myapp
-          name: Release ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            scorekeeper-linux-amd64
+            scorekeeper-linux-arm64
+            scorekeeper-linux-armv7
+
+  # ── Docker image ─────────────────────────────────────────────────────────────
+  # Downloads the pre-built binaries and injects them into the image — no
+  # compilation here. QEMU is registered only for buildx platform awareness;
+  # each platform simply COPYs the right pre-built binary via TARGETPLATFORM.
+  build-docker:
+    name: Docker image
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Mark binaries executable
+        run: chmod +x scorekeeper-linux-amd64 scorekeeper-linux-arm64 scorekeeper-linux-armv7
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
